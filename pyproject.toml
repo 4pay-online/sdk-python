@@ -1,0 +1,34 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "4pay-sdk"
+version = "0.1.0"
+description = "Official SDK for the 4pay.online payment platform — payments, payouts, refunds, webhooks and agentic commerce"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+keywords = ["payments", "4pay", "psp", "agentic-commerce", "ap2", "acp", "a2a", "mcp"]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: MIT License",
+  "Programming Language :: Python :: 3",
+  "Topic :: Office/Business :: Financial",
+]
+# No runtime dependencies on purpose: an SDK that drags in a HTTP stack starts
+# arguments with whatever the integrator already uses.
+dependencies = []
+
+[project.urls]
+Documentation = "https://docs.4pay.online/docs/partners/sdk"
+Source = "https://github.com/4pay-online/sdk-python"
+Issues = "https://github.com/4pay-online/sdk-python/issues"
+
+[project.optional-dependencies]
+crypto = ["cryptography>=41.0"]   # only for AP2 mandate signatures
+dev = ["pytest>=7.0", "cryptography>=41.0"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["fourpay"]
