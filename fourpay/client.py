@@ -44,6 +44,43 @@ def is_settled(status: str) -> bool:
     return status == "charged"
 
 
+def _trimmed(value: Any) -> Optional[str]:
+    """Blank is absent.
+
+    A string of spaces is neither a credential nor an organization. Accepting
+    one would make the constructor's checks a formality and move the failure to
+    the first HTTP call, where a typo in an environment variable reads as a
+    platform fault.
+    """
+    if value is None:
+        return None
+    text = value.strip() if isinstance(value, str) else str(value).strip()
+    return text or None
+
+
+def _host(url: str) -> str:
+    """The host of a base URL — no scheme, no userinfo, no port, no path.
+
+    "Is this a domain of my own?" is a question about the host, and only the
+    host answers it. A URL that carries the same host with a path, a port or
+    credentials in front of it is the same host.
+    """
+    parsed = urllib.parse.urlsplit(url if "//" in url else "//" + url)
+    return (parsed.hostname or "").lower()
+
+
+def _is_shared_host(host: str) -> bool:
+    """Hosts we run ourselves: the apex and everything under it.
+
+    Each serves every organization and names none — the sandbox, the API host
+    and the payment host included. The check exists to refuse a claim that
+    cannot be true: ``organization_from_perimeter`` says a proxy in front of
+    this host pins ``x-organization-id`` for one organization, and in front of
+    ours nothing pins it.
+    """
+    return host == "4pay.online" or host.endswith(".4pay.online")
+
+
 class FourPay:
     """Partner client.
 
@@ -57,6 +94,15 @@ class FourPay:
         tx, url = fourpay.create_hosted_payment(
             amount="10.00", currency="USD", env="test", txid="order-1",
         )
+
+    Every call has to say which organization it acts in, and there are two
+    ways to say it. Either pass ``organization_id`` — the SDK then sends it as
+    ``x-organization-id`` on every call — or set
+    ``organization_from_perimeter`` when your own proxy pins that header for
+    you, and the SDK adds nothing. An API key always takes the first way: it
+    is issued together with its ``organization_id``.
+
+    No credential yet, only a login and a password? :meth:`for_login`.
     """
 
     def __init__(
@@ -68,23 +114,104 @@ class FourPay:
         timeout: float = 30.0,
         max_retries: int = 2,
         user_agent: Optional[str] = None,
+        organization_from_perimeter: bool = False,
+        _login_only: bool = False,
     ) -> None:
-        if not api_key and not bearer_token:
-            raise ValueError("Pass api_key (with organization_id) or bearer_token — there is no anonymous access.")
+        api_key = _trimmed(api_key)
+        bearer_token = _trimmed(bearer_token)
+        organization_id = _trimmed(organization_id)
+        base_url = (_trimmed(base_url) or DEFAULT_BASE_URL).rstrip("/")
+
+        # Whether the proxy in front of base_url pins x-organization-id is a
+        # statement about the caller's deployment, not something the SDK can
+        # see — so the caller makes it and the SDK does not guess.
+        #
+        # It used to guess, by comparing the host against the one default, and
+        # the guess was wrong for every 4pay host but that one: with base_url on
+        # the sandbox, a session token and no organization_id, the client was
+        # built naming no organization and every call it made landed in none.
+        from_perimeter = bool(organization_from_perimeter)
+
+        if not api_key and not bearer_token and not _login_only:
+            raise ValueError(
+                "Pass api_key or bearer_token — there is no anonymous access. Arriving with a "
+                "login and a password instead? FourPay.for_login() builds the client that has no "
+                "credential yet, and its one purpose is to call create_session()."
+            )
         if api_key and not organization_id:
             raise ValueError(
                 "An API key without organization_id is not a credential: the platform resolves the "
                 "key inside the organization named by the x-organization-id header, and refuses the "
-                "request before reading the key. Your operator issues both values together."
+                "request before reading the key. Your operator issues both values together. The "
+                "other way to name an organization — organization_from_perimeter, where your own "
+                "proxy pins that header — belongs to session tokens; this SDK does not take it in "
+                "place of organization_id for a key."
+            )
+        # The claim cannot be true on a host we run: none of ours pins the
+        # header, and a client built on the claim would send no organization at
+        # all. Better caught here than as a 400 from the first call, which reads
+        # as our fault.
+        if from_perimeter and _is_shared_host(_host(base_url)):
+            raise ValueError(
+                f"organization_from_perimeter says a proxy in front of {base_url} pins "
+                "x-organization-id for one organization, but that host is ours: it serves every "
+                "organization and pins nothing. The option is for a domain of your own. On our "
+                "hosts, pass organization_id."
+            )
+        if not organization_id and not from_perimeter and not _login_only:
+            raise ValueError(
+                "A session token still has to say which organization it acts in, and there are two "
+                "ways to say it: pass organization_id, or set organization_from_perimeter when "
+                "your own proxy pins x-organization-id for you. Neither is set, so the call would "
+                "reach no organization at all."
             )
 
         self.api_key = api_key
         self.organization_id = organization_id
         self.bearer_token = bearer_token
-        self.base_url = base_url.rstrip("/")
+        self.base_url = base_url
         self.timeout = timeout
         self.max_retries = max_retries
         self.user_agent = f"4pay-sdk-python/{SDK_VERSION}" + (f" {user_agent}" if user_agent else "")
+        self._organization_from_perimeter = from_perimeter
+
+    @classmethod
+    def for_login(
+        cls,
+        organization_id: Optional[str] = None,
+        base_url: str = DEFAULT_BASE_URL,
+        timeout: float = 30.0,
+        max_retries: int = 2,
+        user_agent: Optional[str] = None,
+        organization_from_perimeter: bool = False,
+    ) -> "FourPay":
+        """A client with no credential yet, whose one purpose is to log in.
+
+        ::
+
+            pay = FourPay.for_login(base_url="https://sandbox.4pay.online")
+            session = pay.create_session("admin@example.com", "secret", "admin")
+            # from here the client carries session["token"] like any other
+
+        The constructor insists on a credential, and login is exactly where you
+        do not have one. ``organization_id`` is optional here, and only here:
+        admins and clients live in the platform's own schema and are found
+        without it, and a partner is searched for across organizations. A
+        ``person`` is not — see :meth:`create_session`.
+
+        Anything other than :meth:`create_session` and :meth:`health` raises
+        until the session token arrives; an unauthenticated call would only
+        come back ``401``.
+        """
+        return cls(
+            organization_id=organization_id,
+            base_url=base_url,
+            timeout=timeout,
+            max_retries=max_retries,
+            user_agent=user_agent,
+            organization_from_perimeter=organization_from_perimeter,
+            _login_only=True,
+        )
 
     # ---------------------------------------------------------------- payments
 
@@ -244,10 +371,26 @@ class FourPay:
     def create_session(self, login: str, password: str, account_type: str = "partner") -> Dict[str, Any]:
         """Exchange login and password for a session token.
 
+        Reachable without a credential through :meth:`for_login`; on a client
+        that already holds one it simply replaces the session token.
+
         ``expire_at`` is Unix **seconds** and the field is singular — code
         written against an ``expires_at`` ISO string reads ``None`` and treats
         the token as immortal.
+
+        A ``person`` is looked up inside one organization's own schema, so that
+        login has to name an organization. ``admin``, ``client`` and ``partner``
+        do not: the first two live in the platform's own schema, and a partner
+        is searched for across organizations.
         """
+        if account_type == "person" and not self.organization_id and not self._organization_from_perimeter:
+            raise ValueError(
+                "A person login has to name an organization: the platform looks the person up in "
+                "that organization's own schema, and with nowhere to look it answers a flat 401 "
+                "that reads like a wrong password. Pass organization_id, or set "
+                "organization_from_perimeter when your own proxy pins x-organization-id for you."
+            )
+
         session = self._request(
             "POST", "/api/v1/session",
             body={"type": account_type, "login": login, "password": password},
@@ -268,6 +411,13 @@ class FourPay:
         idempotent: bool = False,
     ) -> Any:
         """Escape hatch for endpoints the SDK does not wrap yet."""
+        if auth and not self.api_key and not self.bearer_token:
+            raise ValueError(
+                "This client has no credential yet: FourPay.for_login() builds one only to call "
+                "create_session(). Call that first — the session token it returns stays on the "
+                "client — or build the client with an api_key or a bearer_token."
+            )
+
         url = self.base_url + path
         if query:
             pairs = {k: str(v) for k, v in query.items() if v is not None and v != ""}
@@ -282,8 +432,14 @@ class FourPay:
                 headers["x-api-key"] = self.api_key
             if self.bearer_token:
                 headers["authorization"] = f"Bearer {self.bearer_token}"
-            if self.organization_id:
-                headers["x-organization-id"] = self.organization_id
+        # Outside the ``auth`` branch on purpose: this header is not a credential,
+        # it says which organization the call is about, and the unauthenticated
+        # calls need it too. ``create_session`` is the one that matters — a person
+        # login is looked up in that organization's own schema, and without the
+        # header the platform has nowhere to look. Absent means the caller declared
+        # organization_from_perimeter, and the proxy supplies it.
+        if self.organization_id:
+            headers["x-organization-id"] = self.organization_id
 
         # A write is retried only when it carries an idempotency key. Repeating
         # a create without one after a timeout is how one order becomes two

@@ -60,16 +60,31 @@ class _Reader:
 
 
 @pytest.fixture
-def stub(monkeypatch):
-    def build(handler):
-        transport = StubTransport(handler)
-        monkeypatch.setattr("fourpay.client.urllib.request.urlopen", transport)
-        client = FourPay(
-            api_key="key-1", organization_id="org-1",
-            base_url="https://sandbox.4pay.online", max_retries=2,
-        )
+def transport(monkeypatch):
+    """Installs the stub transport and hands it back; the test builds its own client.
+
+    ``stub`` below builds a keyed client, which is what most tests want. The
+    ones about how a client comes into being cannot use it — the client is the
+    thing under test.
+    """
+    def install(handler):
+        recorder = StubTransport(handler)
+        monkeypatch.setattr("fourpay.client.urllib.request.urlopen", recorder)
         monkeypatch.setattr("fourpay.client.time.sleep", lambda _: None)
-        return client, transport
+        return recorder
+    return install
+
+
+@pytest.fixture
+def stub(transport):
+    def build(handler, **overrides):
+        recorder = transport(handler)
+        options = {
+            "api_key": "key-1", "organization_id": "org-1",
+            "base_url": "https://sandbox.4pay.online", "max_retries": 2,
+        }
+        options.update(overrides)
+        return FourPay(**options), recorder
     return build
 
 
